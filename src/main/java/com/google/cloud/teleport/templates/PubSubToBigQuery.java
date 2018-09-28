@@ -66,42 +66,46 @@ import org.slf4j.LoggerFactory;
  *   <li>The Pub/Sub topic exists.
  *   <li>The BigQuery output table exists.
  * </ul>
- *
- * <p><b>Example Usage</b>
- *
- * <pre>
- * # Set the pipeline vars
- * PROJECT_ID=PROJECT ID HERE
- * BUCKET_NAME=BUCKET NAME HERE
- * PIPELINE_FOLDER=gs://${BUCKET_NAME}/dataflow/pipelines/pubsub-to-bigquery
- *
- * # Set the runner
- * RUNNER=DataflowRunner
- *
- * # Build the template
- * mvn compile exec:java \
- * -Dexec.mainClass=com.google.cloud.teleport.templates.PubSubToBigQuery \
- * -Dexec.cleanupDaemonThreads=false \
- * -Dexec.args=" \
- * --project=${PROJECT_ID} \
- * --stagingLocation=${PIPELINE_FOLDER}/staging \
- * --tempLocation=${PIPELINE_FOLDER}/temp \
- * --templateLocation=${PIPELINE_FOLDER}/template \
- * --runner=${RUNNER}"
- *
- * # Execute the template
- * JOB_NAME=pubsub-to-bigquery-$USER-`date +"%Y%m%d-%H%M%S%z"`
- *
- * gcloud dataflow jobs run ${JOB_NAME} \
- * --gcs-location=${PIPELINE_FOLDER}/template \
- * --zone=us-east1-d \
- * --parameters \
- * "inputTopic=projects/data-analytics-pocs/topics/teleport-pubsub-to-bigquery,\
- * outputTableSpec=data-analytics-pocs:demo.pubsub_to_bigquery,\
- * outputDeadletterTable=data-analytics-pocs:demo.pubsub_to_bigquery_deadletter"
- * </pre>
  */
 public class PubSubToBigQuery {
+
+  /**
+   * NOTE: We have had to comprimise on our morals and are keeping config in this
+   *       source file to reduce costs on GCP. It is very important that the
+   *       EVENT_TYPES array is updated and this project is compiled each
+   *       time there is a new event type.
+   */
+
+  /** The Google Project ID. */
+  private static final String PROJECT_ID = "creative-analytics";
+
+  /** The BigQuery Dataset name to insert records into. */
+  private static final String DATASET = "adevents";
+
+  /** The PXYZ Event types to subscribe to. */
+  private static final String[] EVENT_TYPES = {
+    "clickthrough",
+    "dismissal",
+    "engagement",
+    "event",
+    "expand",
+    "impression",
+    "milestone",
+    "render",
+    "request",
+    "survey",
+    "survey_render",
+    "survey_request",
+    "survey_reset",
+    "survey_response",
+    "survey_viewable",
+    "video_fullscreen",
+    "video_mute",
+    "video_play",
+    "video_progress",
+    "video_viewable",
+    "viewable"
+  };
 
   /** The log to output status messages to. */
   private static final Logger LOG = LoggerFactory.getLogger(PubSubToBigQuery.class);
@@ -125,30 +129,13 @@ public class PubSubToBigQuery {
   public static final TupleTag<FailsafeElement<PubsubMessage, String>> TRANSFORM_DEADLETTER_OUT =
       new TupleTag<FailsafeElement<PubsubMessage, String>>() {};
 
-  /** The default suffix for error tables if dead letter table is not specified. */
-  public static final String DEFAULT_DEADLETTER_TABLE_SUFFIX = "_error_records";
-
   /**
    * The {@link Options} class provides the custom execution options passed by the executor at the
    * command-line.
    */
   public interface Options extends PipelineOptions, JavascriptTextTransformerOptions {
-    @Description("Table spec to write the output to")
-    ValueProvider<String> getOutputTableSpec();
+    // JF: No options here as we are HARDCODING WOOOO
 
-    void setOutputTableSpec(ValueProvider<String> value);
-
-    @Description("Pub/Sub topic to read the input from")
-    ValueProvider<String> getInputTopic();
-
-    void setInputTopic(ValueProvider<String> value);
-
-    @Description(
-        "The dead-letter table to output to within BigQuery in <project-id>:<dataset>.<table> "
-            + "format. If it doesn't exist, it will be created during pipeline execution.")
-    ValueProvider<String> getOutputDeadletterTable();
-
-    void setOutputDeadletterTable(ValueProvider<String> value);
   }
 
   /**
@@ -177,6 +164,26 @@ public class PubSubToBigQuery {
   public static PipelineResult run(Options options) {
 
     Pipeline pipeline = Pipeline.create(options);
+    PubsubMessageToTableRow pubsubMsgToTableRow = new PubsubMessageToTableRow(options);
+
+    /* Attach a listener for each event type to the pipeline */
+    for (int i = 0; i < EVENT_TYPES.length; i++) {
+      attachEventType(
+          pipeline,
+          EVENT_TYPES[i],
+          pubsubMsgToTableRow
+      );
+    }
+    return pipeline.run();
+  }
+
+  public static Pipeline attachEventType(
+      Pipeline pipeline, String eventType, PubsubMessageToTableRow pubsubMsgToTableRow) {
+
+    String inputTopic = "projects/" + PROJECT_ID + "/topics/" + eventType;
+    String tableSpec = PROJECT_ID + ":" + DATASET + "." + eventType;
+    // Send all errors to the same dead letter table
+    String deadLetterTable = PROJECT_ID + ":" + DATASET + ".dead";
 
     // Register the coder for pipeline
     FailsafeElementCoder<PubsubMessage, String> coder =
@@ -201,12 +208,13 @@ public class PubSubToBigQuery {
              */
             .apply(
                 "ReadPubsubMessages",
-                PubsubIO.readMessagesWithAttributes().fromTopic(options.getInputTopic()))
+                PubsubIO.readMessagesWithAttributes().fromTopic(inputTopic)
+            )
 
             /*
              * Step #2: Transform the PubsubMessages into TableRows
              */
-            .apply("ConvertMessageToTableRow", new PubsubMessageToTableRow(options));
+            .apply("ConvertMessageToTableRow", pubsubMsgToTableRow);
 
     /*
      * Step #3: Write the successful records out to BigQuery
@@ -219,7 +227,8 @@ public class PubSubToBigQuery {
                 .withoutValidation()
                 .withCreateDisposition(CreateDisposition.CREATE_NEVER)
                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
-                .to(options.getOutputTableSpec()));
+                .to(tableSpec)
+          );
 
     /*
      * Step #4: Write failed records out to BigQuery
@@ -231,14 +240,13 @@ public class PubSubToBigQuery {
             "WriteFailedRecords",
             WritePubsubMessageErrors.newBuilder()
                 .setErrorRecordsTable(
-                    maybeUseDefaultDeadletterTable(
-                        options.getOutputDeadletterTable(),
-                        options.getOutputTableSpec(),
-                        DEFAULT_DEADLETTER_TABLE_SUFFIX))
+                  ValueProvider.StaticValueProvider.of(deadLetterTable)
+                )
                 .setErrorRecordsTableSchema(getDeadletterTableSchemaJson())
-                .build());
+                .build()
+        );
 
-    return pipeline.run();
+    return pipeline;
   }
 
   /**
@@ -311,7 +319,8 @@ public class PubSubToBigQuery {
                       .setFunctionName(options.getJavascriptTextTransformFunctionName())
                       .setSuccessTag(UDF_OUT)
                       .setFailureTag(UDF_DEADLETTER_OUT)
-                      .build());
+                      .build()
+              );
 
       // Convert the records which were successfully processed by the UDF into TableRow objects.
       PCollectionTuple jsonToTableRowOut =
@@ -322,7 +331,8 @@ public class PubSubToBigQuery {
                   FailsafeJsonToTableRow.<PubsubMessage>newBuilder()
                       .setSuccessTag(TRANSFORM_OUT)
                       .setFailureTag(TRANSFORM_DEADLETTER_OUT)
-                      .build());
+                      .build()
+              );
 
       // Re-wrap the PCollections so we can return a single PCollectionTuple
       return PCollectionTuple.of(UDF_OUT, udfOut.get(UDF_OUT))
@@ -343,7 +353,8 @@ public class PubSubToBigQuery {
     public void processElement(ProcessContext context) {
       PubsubMessage message = context.element();
       context.output(
-          FailsafeElement.of(message, new String(message.getPayload(), StandardCharsets.UTF_8)));
+          FailsafeElement.of(message, new String(message.getPayload(), StandardCharsets.UTF_8))
+      );
     }
   }
 
