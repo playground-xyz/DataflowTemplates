@@ -94,16 +94,16 @@ public class PubSubToBigQuery {
     "render",
     "request",
     "survey",
-    "survey_render",
-    "survey_request",
-    "survey_reset",
-    "survey_response",
-    "survey_viewable",
-    "video_fullscreen",
-    "video_mute",
-    "video_play",
-    "video_progress",
-    "video_viewable",
+    "survey-render",
+    "survey-request",
+    "survey-reset",
+    "survey-response",
+    "survey-viewable",
+    "video-fullscreen",
+    "video-mute",
+    "video-play",
+    "video-progress",
+    "video-viewable",
     "viewable"
   };
 
@@ -181,7 +181,7 @@ public class PubSubToBigQuery {
       Pipeline pipeline, String eventType, PubsubMessageToTableRow pubsubMsgToTableRow) {
 
     String inputTopic = "projects/" + PROJECT_ID + "/topics/" + eventType;
-    String tableSpec = PROJECT_ID + ":" + DATASET + "." + eventType;
+    String tableSpec = PROJECT_ID + ":" + DATASET + "." + eventType.replace('-', '_');
     // Send all errors to the same dead letter table
     String deadLetterTable = PROJECT_ID + ":" + DATASET + ".dead";
 
@@ -207,14 +207,14 @@ public class PubSubToBigQuery {
              * Step #1: Read messages in from Pub/Sub
              */
             .apply(
-                "ReadPubsubMessages",
+                "ReadPubsubMessages/" + eventType,
                 PubsubIO.readMessagesWithAttributes().fromTopic(inputTopic)
             )
 
             /*
              * Step #2: Transform the PubsubMessages into TableRows
              */
-            .apply("ConvertMessageToTableRow", pubsubMsgToTableRow);
+            .apply("ConvertMessageToTableRow/" + eventType, pubsubMsgToTableRow);
 
     /*
      * Step #3: Write the successful records out to BigQuery
@@ -222,7 +222,7 @@ public class PubSubToBigQuery {
     transformOut
         .get(TRANSFORM_OUT)
         .apply(
-            "WriteSuccessfulRecords",
+            "WriteSuccessfulRecords/" + eventType,
             BigQueryIO.writeTableRows()
                 .withoutValidation()
                 .withCreateDisposition(CreateDisposition.CREATE_NEVER)
@@ -235,9 +235,9 @@ public class PubSubToBigQuery {
      */
     PCollectionList.of(transformOut.get(UDF_DEADLETTER_OUT))
         .and(transformOut.get(TRANSFORM_DEADLETTER_OUT))
-        .apply("Flatten", Flatten.pCollections())
+        .apply("Flatten/" + eventType, Flatten.pCollections())
         .apply(
-            "WriteFailedRecords",
+            "WriteFailedRecords/" + eventType,
             WritePubsubMessageErrors.newBuilder()
                 .setErrorRecordsTable(
                   ValueProvider.StaticValueProvider.of(deadLetterTable)
