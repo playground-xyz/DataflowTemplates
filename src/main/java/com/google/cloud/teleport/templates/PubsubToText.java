@@ -34,6 +34,7 @@ import org.apache.beam.sdk.options.StreamingOptions;
 import org.apache.beam.sdk.options.Validation.Required;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.options.ValueProvider.NestedValueProvider;
+import org.apache.beam.sdk.options.ValueProvider.StaticValueProvider;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.windowing.FixedWindows;
 import org.apache.beam.sdk.transforms.windowing.Window;
@@ -65,44 +66,44 @@ import org.apache.beam.sdk.transforms.windowing.Window;
  */
 public class PubsubToText {
 
+
+  /** The Google Project ID. */
+  private static final String PROJECT_ID = "creative-analytics";
+
+  /** The GCS bucket to insert records into. */
+  private static final String BUCKET_NAME = "adevents.playground.xyz";
+
+  /** The PXYZ Event types to subscribe to. */
+  private static final String[] EVENT_TYPES = {
+    "clickthrough",
+    "dismissal",
+    "engagement",
+    "event",
+    "expand",
+    "impression",
+    "milestone",
+    "render",
+    "request",
+    "survey",
+    "survey-render",
+    "survey-request",
+    "survey-reset",
+    "survey-response",
+    "survey-viewable",
+    "video-fullscreen",
+    "video-mute",
+    "video-play",
+    "video-progress",
+    "video-viewable",
+    "viewable"
+  };
+
   /**
    * Options supported by the pipeline.
    *
    * <p>Inherits standard configuration options.</p>
    */
   public interface Options extends PipelineOptions, StreamingOptions {
-    @Description("The Cloud Pub/Sub topic to read from.")
-    @Required
-    ValueProvider<String> getInputTopic();
-    void setInputTopic(ValueProvider<String> value);
-
-    @Description("The directory to output files to. Must end with a slash.")
-    @Required
-    ValueProvider<String> getOutputDirectory();
-    void setOutputDirectory(ValueProvider<String> value);
-
-    @Description("The filename prefix of the files to write to.")
-    @Default.String("output")
-    @Required
-    ValueProvider<String> getOutputFilenamePrefix();
-    void setOutputFilenamePrefix(ValueProvider<String> value);
-
-    @Description("The suffix of the files to write.")
-    @Default.String("")
-    ValueProvider<String> getOutputFilenameSuffix();
-    void setOutputFilenameSuffix(ValueProvider<String> value);
-
-    @Description("The shard template of the output file. Specified as repeating sequences "
-        + "of the letters 'S' or 'N' (example: SSS-NNN). These are replaced with the "
-        + "shard number, or number of shards respectively")
-    @Default.String("W-P-SS-of-NN")
-    ValueProvider<String> getOutputShardTemplate();
-    void setOutputShardTemplate(ValueProvider<String> value);
-
-    @Description("The maximum number of output shards produced when writing.")
-    @Default.Integer(1)
-    Integer getNumShards();
-    void setNumShards(Integer value);
 
     @Description("The window duration in which data will be written. Defaults to 5m. "
         + "Allowed formats are: "
@@ -140,6 +141,20 @@ public class PubsubToText {
     // Create the pipeline
     Pipeline pipeline = Pipeline.create(options);
 
+    /* Attach a listener for each event type to the pipeline */
+    for (int i = 0; i < EVENT_TYPES.length; i++) {
+      attachEventType(
+          pipeline,
+          EVENT_TYPES[i],
+          options
+      );
+    }
+
+    return pipeline.run();
+  }
+
+  public static Pipeline attachEventType(Pipeline pipeline, String eventType, Options options) {
+    String outputFolder = "gs://" + BUCKET_NAME + "/backup/" + eventType + "/";
     /*
      * Steps:
      *   1) Read string messages from PubSub
@@ -147,30 +162,31 @@ public class PubsubToText {
      *   3) Output the windowed files to GCS
      */
     pipeline
-        .apply("Read PubSub Events", PubsubIO.readStrings().fromTopic(options.getInputTopic()))
+        .apply("Read PubSub Events/" + eventType, PubsubIO.readStrings()
+              .fromTopic("projects/" + PROJECT_ID + "/topics/" + eventType))
         .apply(
-            options.getWindowDuration() + " Window",
-            Window.into(FixedWindows.of(DurationUtils.parseDuration(options.getWindowDuration()))))
+            options.getWindowDuration() + " Window/" + eventType,
+            Window.into(FixedWindows.of(DurationUtils.parseDuration(options.getWindowDuration())))
+        )
 
         // Apply windowed file writes. Use a NestedValueProvider because the filename
         // policy requires a resourceId generated from the input value at runtime.
         .apply(
-            "Write File(s)",
+            "Write File(s)/" + eventType,
             TextIO.write()
                 .withWindowedWrites()
-                .withNumShards(options.getNumShards())
-                .to(
-                    new WindowedFilenamePolicy(
-                        options.getOutputDirectory(),
-                        options.getOutputFilenamePrefix(),
-                        options.getOutputShardTemplate(),
-                        options.getOutputFilenameSuffix()))
+                .withNumShards(1)
+                .to(new WindowedFilenamePolicy(
+                    StaticValueProvider.of(outputFolder),
+                    StaticValueProvider.of(""),
+                    StaticValueProvider.of("W"),
+                    StaticValueProvider.of("")
+                ))
                 .withTempDirectory(NestedValueProvider.of(
-                    options.getOutputDirectory(),
+                    StaticValueProvider.of(outputFolder),
                     (SerializableFunction<String, ResourceId>) input ->
                         FileBasedSink.convertToFileResourceIfPossible(input))));
 
-    // Execute the pipeline and return the result.
-    return pipeline.run();
+    return pipeline;
   }
 }
